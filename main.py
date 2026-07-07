@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import argparse
+import logging
 import math
 from collections import deque
 from collections.abc import Callable
@@ -18,6 +19,8 @@ import napari
 from napari.utils.colormaps import DirectLabelColormap
 from qtpy import QtWidgets, QtCore, QtGui
 from tqdm import tqdm
+
+LOGGER = logging.getLogger(__name__)
 
 # =========================
 # input / output paths
@@ -62,6 +65,8 @@ ZOOM_WHEEL_RATIO = 1.1
 # Undo history (per layer)
 MAX_HISTORY = 60
 FRAME_CACHE_LIMIT = 4
+AUTOSAVE_DELAY_MS = 700
+CHANGE_SCAN_MS = 500
 FILL_STRUCTURE = np.array(
     [
         [False, True, False],
@@ -846,7 +851,7 @@ class InputFilter(QtCore.QObject):
         return event.globalPos()
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None) -> None:
     input_path, mask_dir_override, output_root, video_fps = resolve_runtime_paths(argv)
     rgb_dir, mask_dir, rgb_map, mask_map, keys = prepare_input_output_checked(
         input_path,
@@ -890,6 +895,13 @@ def main(argv: list[str] | None = None):
     frame_executor = ThreadPoolExecutor(max_workers=2)
 
     viewer = napari.Viewer(title="Mask Editor (L1/L2 separate layers)")
+    autosave_timer = QtCore.QTimer(viewer.window._qt_window)
+    autosave_timer.setSingleShot(True)
+    autosave_timer.setInterval(AUTOSAVE_DELAY_MS)
+    change_timer = QtCore.QTimer(viewer.window._qt_window)
+    change_timer.setInterval(CHANGE_SCAN_MS)
+    mask_snapshot: np.ndarray | None = None
+
     img_layer = None
     l1_layer = None
     l2_layer = None
@@ -1275,7 +1287,7 @@ def main(argv: list[str] | None = None):
         finally:
             hist_L1.suspend = False
 
-        state["dirty"] = True
+        markChange("L1")
         apply_colormaps()
         refresh_page_ui()
         set_window_title(extra=f"(L1 fill @ x={x}, y={y}, label={state['label']})")
@@ -1370,43 +1382,102 @@ def main(argv: list[str] | None = None):
     # ======================
     # History hooks (snapshots) - 유지
     # ======================
+    def syncMaskSnapshot() -> None:
+        nonlocal mask_snapshot
+        if l1_layer is None:
+            mask_snapshot = None
+            return
+        mask_snapshot = np.asarray(l1_layer.data).copy()
+
+    def checkMaskChange() -> bool:
+        if l1_layer is None:
+            return False
+        if mask_snapshot is None:
+            return False
+
+        mask_data = np.asarray(l1_layer.data)
+        shape_match = mask_data.shape == mask_snapshot.shape
+        data_match = shape_match and np.array_equal(mask_data, mask_snapshot)
+        return not data_match
+
+    def scanMaskChange() -> None:
+        if state["suspend"] or l1_layer is None:
+            return
+        if mask_snapshot is None:
+            syncMaskSnapshot()
+            return
+        if not checkMaskChange():
+            return
+        markChange("L1")
+
+    def scheduleAutosave() -> None:
+        autosave_timer.start(AUTOSAVE_DELAY_MS)
+
     def markChange(layer: str) -> None:
         if state["suspend"]:
             return
         if layer != "L1":
             return
-        if state["dirty"]:
-            return
         state["dirty"] = True
+        syncMaskSnapshot()
+        scheduleAutosave()
         set_window_title()
         refresh_page_ui()
 
     # ======================
     # IO / navigation
     # ======================
-    def save_current_l1_only(*_args):
+    def writeMask() -> Path | None:
         if l1_layer is None:
-            return
-        k = keys[state["idx"]]          # frame stem name
-        out_path = mask_map[k]
-        out = bin01_to_mask255(np.asarray(l1_layer.data))
+            return None
+        frame_key = keys[state["idx"]]
+        mask_path = mask_map[frame_key]
+        mask_data = bin01_to_mask255(np.asarray(l1_layer.data))
         try:
-            iio.imwrite(out_path, out)
+            iio.imwrite(mask_path, mask_data)
         except Exception as exc:
-            raise RuntimeError(f"Mask save failed: {out_path}") from exc
-        dropFrame(k)
+            raise RuntimeError(f"Mask save failed: {mask_path}") from exc
+        dropFrame(frame_key)
+        syncMaskSnapshot()
         state["dirty"] = False
+        return mask_path
+
+    def saveMask(*_args: object) -> None:
+        if autosave_timer.isActive():
+            autosave_timer.stop()
+        mask_path = writeMask()
+        if mask_path is None:
+            return
 
         # ✅ 세션 전체 누적 save idx + 로그 추가
         state["save_idx"] += 1
-        log_append(f"Saved {state['save_idx']}: {out_path.name}")
+        log_append(f"Saved {state['save_idx']}: {mask_path.name}")
 
-        set_window_title(extra=f"(saved L1 only: {out_path.name})")
+        set_window_title(extra=f"(saved L1 only: {mask_path.name})")
         refresh_page_ui()
 
-    def open_current():
+    def flushAutosave(alert: bool = False) -> bool:
+        if not state["dirty"]:
+            return True
+        try:
+            saveMask()
+            return True
+        except Exception as exc:
+            log_append(f"Auto-save failed: {type(exc).__name__}: {exc}")
+            if alert:
+                QtWidgets.QMessageBox.critical(
+                    viewer.window._qt_window,
+                    "Auto-save failed",
+                    f"현재 프레임 저장 중 오류가 발생해서 이동을 취소합니다.\n\n{type(exc).__name__}: {exc}",
+                )
+            set_window_title(extra=f"(AUTO SAVE ERROR: {type(exc).__name__})")
+            return False
+
+    def openFrame() -> None:
         nonlocal img_layer, l1_layer, l2_layer
 
+        if autosave_timer.isActive():
+            autosave_timer.stop()
         k = keys[state["idx"]]
         rgb, l1, l2 = readFrame(k)
 
@@ -1425,6 +1496,7 @@ def main(argv: list[str] | None = None):
             if l1_layer is None:
                 l1_layer = viewer.add_labels(l1, name="L1 (main/save)")
                 l1_layer.events.data.connect(lambda _event=None: markChange("L1"))
+                l1_layer.events.paint.connect(lambda _event=None: markChange("L1"))
                 l1_layer.events.opacity.connect(_l1_opacity_changed)
                 l1_layer.events.visible.connect(_l1_visible_changed)
                 l1_layer.events.brush_size.connect(lambda _event=None: _label_layer_brush_size_changed("L1"))
@@ -1448,6 +1520,7 @@ def main(argv: list[str] | None = None):
             state["suspend"] = False
 
         state["dirty"] = False
+        syncMaskSnapshot()
         apply_colormaps()
         apply_zoom(state["zoom"])
         restore_editor_state()
@@ -1456,45 +1529,38 @@ def main(argv: list[str] | None = None):
         set_window_title()
         refresh_page_ui()
 
-    def goto_index(new_idx: int):
-        new_idx = int(np.clip(new_idx, 0, len(keys) - 1))
-        prev = state["idx"]
-        state["idx"] = new_idx
+    def gotoFrame(frame_index: int) -> None:
+        frame_index = int(np.clip(frame_index, 0, len(keys) - 1))
+        source_index = state["idx"]
+        state["idx"] = frame_index
         try:
-            open_current()
-        except Exception as e:
-            state["idx"] = prev
-            set_window_title(extra=f"(OPEN ERROR: {type(e).__name__})")
-            print("[OPEN ERROR]", e)
+            openFrame()
+        except Exception as exc:
+            state["idx"] = source_index
+            set_window_title(extra=f"(OPEN ERROR: {type(exc).__name__})")
+            LOGGER.exception("Open frame failed")
 
-    def autosave_before_navigation() -> bool:
+    def autosaveBeforeNavigation() -> bool:
         if l1_layer is None:
             return True
+        scanMaskChange()
+        if autosave_timer.isActive():
+            autosave_timer.stop()
         if not state["dirty"]:
             return True
-        try:
-            save_current_l1_only()
-            return True
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                viewer.window._qt_window,
-                "Auto-save failed",
-                f"현재 프레임 저장 중 오류가 발생해서 이동을 취소합니다.\n\n{type(e).__name__}: {e}",
-            )
-            set_window_title(extra=f"(AUTO SAVE ERROR: {type(e).__name__})")
-            return False
+        return flushAutosave(alert=True)
 
-    def navigate_to_index(new_idx: int):
+    def navigateFrame(frame_index: int) -> None:
         remember_current_brush_size()
-        if not autosave_before_navigation():
+        if not autosaveBeforeNavigation():
             return
-        goto_index(new_idx)
+        gotoFrame(frame_index)
 
-    def next_frame(*_args):
-        navigate_to_index(state["idx"] + 1)
+    def nextFrame(*_args: object) -> None:
+        navigateFrame(state["idx"] + 1)
 
-    def prev_frame(*_args):
-        navigate_to_index(state["idx"] - 1)
+    def prevFrame(*_args: object) -> None:
+        navigateFrame(state["idx"] - 1)
 
     # ======================
     # ops
@@ -1535,7 +1601,7 @@ def main(argv: list[str] | None = None):
             hist_L1.suspend = False
             hist_L2.suspend = False
 
-        state["dirty"] = True
+        markChange("L1")
         apply_colormaps()
         set_window_title(extra="(merged L2 into L1, cleared L2)")
         refresh_page_ui()
@@ -1594,7 +1660,7 @@ def main(argv: list[str] | None = None):
             log_append(f"MASK deleted: {Path(mask_path).name}")
 
         try:
-            open_current()
+            openFrame()
             set_window_title(extra=f"(deleted: {k})")
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1637,8 +1703,8 @@ def main(argv: list[str] | None = None):
     nav = QtWidgets.QHBoxLayout()
     bprev = QtWidgets.QPushButton("Prev")
     bnext = QtWidgets.QPushButton("Next")
-    bprev.clicked.connect(prev_frame)
-    bnext.clicked.connect(next_frame)
+    bprev.clicked.connect(prevFrame)
+    bnext.clicked.connect(nextFrame)
     nav.addWidget(bprev); nav.addWidget(bnext)
     L.addLayout(nav)
 
@@ -1654,14 +1720,14 @@ def main(argv: list[str] | None = None):
     L.addWidget(page_slider); L.addWidget(page_spin)
 
     def changePage(value: int) -> None:
-        navigate_to_index(int(value) - 1)
+        navigateFrame(int(value) - 1)
 
     page_slider.valueChanged.connect(changePage)
     page_spin.valueChanged.connect(changePage)
 
     # Save
     save_btn = QtWidgets.QPushButton("SAVE (L1 only)")
-    save_btn.clicked.connect(save_current_l1_only)
+    save_btn.clicked.connect(saveMask)
     L.addWidget(save_btn)
 
     delete_btn = QtWidgets.QPushButton("DELETE current frame + mask")
@@ -1846,8 +1912,8 @@ def main(argv: list[str] | None = None):
     input_filter = InputFilter(
         qt_window,
         canvas_widget,
-        next_frame,
-        prev_frame,
+        nextFrame,
+        prevFrame,
         adjustBrushRange,
         adjustImageZoom,
         adjustImagePan,
@@ -1856,11 +1922,11 @@ def main(argv: list[str] | None = None):
         application.installEventFilter(input_filter)
         state["input_filter"] = input_filter
 
-    bindMany(["Q", "Left", "Up"], prev_frame)
-    bindMany(["W", "Enter", "Right", "Down"], next_frame)
-    bindMany(["PageDown", "PgDown", "Next"], next_frame)
-    bindMany(["PageUp", "PgUp", "Prior"], prev_frame)
-    bindMany(["Control-S"], save_current_l1_only)
+    bindMany(["Q", "Left", "Up"], prevFrame)
+    bindMany(["W", "Enter", "Right", "Down"], nextFrame)
+    bindMany(["PageDown", "PgDown", "Next"], nextFrame)
+    bindMany(["PageUp", "PgUp", "Prior"], prevFrame)
+    bindMany(["Control-S"], saveMask)
     bindMany(["Control-Delete"], delete_current_pair)
 
     bindMany(["End"], undo_via_ctrl_z)
@@ -1878,7 +1944,11 @@ def main(argv: list[str] | None = None):
     bindMany(["/", "Slash"], toggle_tool_mode)
 
     # start
-    open_current()
+    autosave_timer.timeout.connect(flushAutosave)
+    change_timer.timeout.connect(scanMaskChange)
+    change_timer.start()
+
+    openFrame()
     sync_zoom_ui(state["zoom"])
     sync_brush_ui()
     sync_buttons()
@@ -1891,6 +1961,17 @@ def main(argv: list[str] | None = None):
     try:
         napari.run()
     finally:
+        if autosave_timer.isActive():
+            autosave_timer.stop()
+        try:
+            if checkMaskChange():
+                state["dirty"] = True
+            if state["dirty"]:
+                mask_path = writeMask()
+                if mask_path is not None:
+                    LOGGER.info("Final mask saved: %s", mask_path)
+        except Exception:
+            LOGGER.exception("Final mask save failed")
         frame_executor.shutdown(wait=False, cancel_futures=True)
 
 
