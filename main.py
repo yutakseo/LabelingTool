@@ -1,4 +1,4 @@
-# labeling_video_no_model.py
+# main.py
 # pip install "napari[all]" imageio imageio-ffmpeg numpy qtpy tqdm
 
 from __future__ import annotations
@@ -305,7 +305,7 @@ def build_missing_input_message(input_path: Path) -> str:
                 preview += ", ..."
             lines.append(f"같은 폴더의 후보 파일: {preview}")
 
-    lines.append(r"실행 예: python labeling_video.py Z:\CODE\video\kia-1-1.mp4")
+    lines.append(r"실행 예: python main.py Z:\CODE\video\kia-1-1.mp4")
     return "\n".join(lines)
 
 
