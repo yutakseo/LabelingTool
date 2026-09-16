@@ -28,12 +28,12 @@ LOGGER = logging.getLogger(__name__)
 # 사용자가 설정할 세 가지 경로
 # 1) 원본 이미지 파일, 이미지 폴더 또는 비디오
 ORIGINAL_IMAGE_INPUT_PATH = Path(
-    r"D:\workspace\LabelingTool\output\시범 라벨링\images\c1_mono_cropped.png"
+    r"D:\workspace\LabelingTool\output\시범 라벨링_v2\images\c1_mono_cropped.png"
 )
 
 # 2) 최초 라벨로 사용할 수도 마스크 파일 또는 마스크 폴더(None 가능)
 PSEUDO_MASK_INPUT_PATH: Path | None = Path(
-    r"D:\workspace\LabelingTool\output\시범 라벨링\masks\c1_mono_cropped.png"
+    r"D:\workspace\LabelingTool\output\시범 라벨링_v2\masks\c1_mono_cropped.png"
 )
 
 # 3) 학습용 데이터셋을 생성할 상위 폴더
