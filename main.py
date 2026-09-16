@@ -27,19 +27,19 @@ LOGGER = logging.getLogger(__name__)
 # =========================
 # 1) 이미지 폴더를 바로 쓰고 싶으면 폴더 경로 지정
 # 2) 비디오를 쓰고 싶으면 mp4/avi/... 파일 경로 지정
-INPUT_PATH = Path(r"e:\workspace\labeller\input\716-2(RH)(2)\images")
+INPUT_PATH = Path(r"D:\workspace\LabelingTool\__raw_data\c1_mono_cropped.png")
 
 # 비디오 입력일 때 프레임 이미지 / 마스크를 저장할 기준 폴더
 # 예: INPUT_PATH가 ex1.mp4 이면
 #   AUTO_OUTPUT_ROOT/ex1/images
 #   AUTO_OUTPUT_ROOT/ex1/masks
 # 가 자동 생성됨
-AUTO_OUTPUT_ROOT = None
+AUTO_OUTPUT_ROOT = Path(r"D:\workspace\LabelingTool\output")
 
 # 이미지 폴더 입력일 때 사용할 마스크 폴더
 # None이면 자동으로 INPUT_PATH의 형제 폴더에
 # "<입력폴더명>_masks" 를 생성해서 사용
-MASK_DIR = Path(r"e:\workspace\labeller\input\716-2(RH)(2)\masks")
+MASK_DIR = Path(r"D:\workspace\LabelingTool\pseudo_labeller\processed")
 
 RGB_EXTS   = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 MASK_EXTS  = {".png", ".tif", ".tiff", ".bmp"}
@@ -102,12 +102,12 @@ FrameFuture: TypeAlias = dict[str, Future[FrameData]]
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open an image folder or video file in the napari labeling tool."
+        description="Open an image file, image folder, or video file in the napari labeling tool."
     )
     parser.add_argument(
         "input_path",
         nargs="?",
-        help="Image folder or video file path. Defaults to INPUT_PATH in this file.",
+        help="Image file, image folder, or video file path. Defaults to INPUT_PATH in this file.",
     )
     parser.add_argument(
         "--mask-dir",
@@ -484,9 +484,14 @@ def source_frame_index_for_output(
     return min(src_idx, total_frames - 1)
 
 
-def ensure_mask_files_for_rgb(rgb_dir: Path, mask_dir: Path) -> dict[str, Path]:
+def ensure_mask_files_for_rgb(
+    rgb_dir: Path,
+    mask_dir: Path,
+    rgb_map: dict[str, Path] | None = None,
+) -> dict[str, Path]:
     """RGB 기준으로 비어있는 마스크 파일을 자동 생성해서 stem 매칭을 보장"""
-    rgb_map = list_images(rgb_dir, RGB_EXTS)
+    if rgb_map is None:
+        rgb_map = list_images(rgb_dir, RGB_EXTS)
     mask_dir.mkdir(parents=True, exist_ok=True)
 
     out: dict[str, Path] = {}
@@ -603,13 +608,21 @@ def prepare_input_output(
         rgb_map = dict(sorted(list_images(rgb_dir, RGB_EXTS).items()))
         if not rgb_map:
             raise RuntimeError(f"이미지 폴더에 읽을 수 있는 이미지가 없어요: {rgb_dir}")
+    elif input_path.is_file() and input_path.suffix.lower() in RGB_EXTS:
+        # A single image is handled as a one-frame labeling project.
+        rgb_dir = input_path.parent
+        if mask_dir_override is not None:
+            mask_dir = Path(mask_dir_override)
+        else:
+            mask_dir = input_path.parent / f"{input_path.stem}_masks"
+        rgb_map = {input_path.stem: input_path}
     else:
         raise FileNotFoundError(
             "INPUT_PATH가 유효한 이미지 폴더도 아니고 지원되는 비디오 파일도 아니에요: "
             f"{input_path}"
         )
 
-    mask_map = dict(sorted(ensure_mask_files_for_rgb(rgb_dir, mask_dir).items()))
+    mask_map = dict(sorted(ensure_mask_files_for_rgb(rgb_dir, mask_dir, rgb_map).items()))
     keys = sorted(set(rgb_map.keys()) & set(mask_map.keys()))
     if not keys:
         raise RuntimeError(
@@ -1306,21 +1319,11 @@ def main(argv: list[str] | None = None) -> None:
         state["active"] = "L1" if str(name).upper() == "L1" else "L2"
         apply_active_state_to_layer()
 
-    def set_selected_label(lbl: int, *_args, preserve_brush: bool = False):
-        current_brush = None
-        if preserve_brush:
-            layer = active_layer_obj()
-            if layer is not None:
-                try:
-                    current_brush = int(round(float(layer.brush_size)))
-                    current_brush = int(np.clip(current_brush, BRUSH_MIN, BRUSH_MAX))
-                except Exception:
-                    current_brush = None
+    def set_selected_label(lbl: int, *_args):
+        # Store the current tool's size before switching.  The new tool then
+        # restores its own saved size instead of inheriting the old one.
         remember_current_brush_size()
         state["label"] = 0 if int(lbl) == 0 else 1
-        if preserve_brush and current_brush is not None:
-            state[f"{state['active']}_b{state['label']}"] = current_brush
-            sync_brush_ui()
         apply_active_state_to_layer()
 
     def set_tool_mode(mode: str, *_args):
@@ -1935,8 +1938,8 @@ def main(argv: list[str] | None = None) -> None:
     bindMany(["F1"], lambda *_: set_active_layer("L1"))
     bindMany(["F2"], lambda *_: set_active_layer("L2"))
 
-    bindMany(["A"], lambda *_: set_selected_label(0, preserve_brush=True))
-    bindMany(["S"], lambda *_: set_selected_label(1, preserve_brush=True))
+    bindMany(["A"], lambda *_: set_selected_label(0))
+    bindMany(["S"], lambda *_: set_selected_label(1))
     bindMany(["X"], lambda *_: set_tool_mode("paint"))
     bindMany(["B"], lambda *_: set_tool_mode("paint"))
     bindMany(["F"], lambda *_: set_tool_mode("fill"))

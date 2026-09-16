@@ -1,6 +1,9 @@
-numpy==1.26.4
-napari==0.6.6
-imageio-ffmpeg==0.6.0
-imageio==2.37.0
-QtPy==2.4.3
-tqdm==4.67.3
+# Windows system Python 3.14 compatible dependencies (no virtual environment).
+# The Qt backend is installed through napari[all].
+numpy>=2.5
+napari[all]>=0.9.1
+imageio-ffmpeg>=0.6
+imageio>=2.37
+QtPy>=2.4
+scipy>=1.18
+tqdm>=4.70
