@@ -3,3 +3,4 @@ __pycache__/
 input/
 pseudo_labeller
 *.png
+*.json

@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 import argparse
+import json
 import logging
 import math
+import shutil
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
@@ -19,27 +21,30 @@ import napari
 from napari.utils.colormaps import DirectLabelColormap
 from qtpy import QtWidgets, QtCore, QtGui
 from tqdm import tqdm
+import time
 
 LOGGER = logging.getLogger(__name__)
 
-# =========================
-# input / output paths
-# =========================
-# 1) 이미지 폴더를 바로 쓰고 싶으면 폴더 경로 지정
-# 2) 비디오를 쓰고 싶으면 mp4/avi/... 파일 경로 지정
-INPUT_PATH = Path(r"D:\workspace\LabelingTool\__raw_data\c1_mono_cropped.png")
+# 사용자가 설정할 세 가지 경로
+# 1) 원본 이미지 파일, 이미지 폴더 또는 비디오
+ORIGINAL_IMAGE_INPUT_PATH = Path(
+    r"D:\workspace\LabelingTool\output\시범 라벨링\images\c1_mono_cropped.png"
+)
 
-# 비디오 입력일 때 프레임 이미지 / 마스크를 저장할 기준 폴더
-# 예: INPUT_PATH가 ex1.mp4 이면
-#   AUTO_OUTPUT_ROOT/ex1/images
-#   AUTO_OUTPUT_ROOT/ex1/masks
-# 가 자동 생성됨
-AUTO_OUTPUT_ROOT = Path(r"D:\workspace\LabelingTool\output")
+# 2) 최초 라벨로 사용할 수도 마스크 파일 또는 마스크 폴더(None 가능)
+PSEUDO_MASK_INPUT_PATH: Path | None = Path(
+    r"D:\workspace\LabelingTool\output\시범 라벨링\masks\c1_mono_cropped.png"
+)
 
-# 이미지 폴더 입력일 때 사용할 마스크 폴더
-# None이면 자동으로 INPUT_PATH의 형제 폴더에
-# "<입력폴더명>_masks" 를 생성해서 사용
-MASK_DIR = Path(r"D:\workspace\LabelingTool\pseudo_labeller\processed")
+# 3) 학습용 데이터셋을 생성할 상위 폴더
+DATASET_OUTPUT_PARENT_PATH = Path(r"D:\workspace\LabelingTool\output")
+DATASET_SESSION_NAME = time.strftime("%Y%m%d_%H%M")
+
+# Add, remove, or rename classes here.  The numeric key is the value saved in
+# the multi-class mask; names and colours are reflected in the labeling UI.
+CLASS_DEFINITIONS: dict[int, dict[str, object]] = {
+    1: {"name": "class_1", "color": (0.0, 1.0, 0.0, 1.0)},
+}
 
 RGB_EXTS   = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 MASK_EXTS  = {".png", ".tif", ".tiff", ".bmp"}
@@ -54,7 +59,7 @@ FPS_DIR_PREFIX = "fps_"
 BRUSH_MIN = 1
 BRUSH_MAX = 100
 BRUSH_STEP = 1
-BRUSH_WHEEL_STEP = 5
+BRUSH_WHEEL_STEP = 3
 
 # Zoom
 ZOOM_MIN = 0.1
@@ -95,9 +100,98 @@ RIGHT_BUTTON = QtCore.Qt.MouseButton.RightButton
 NavAction: TypeAlias = Callable[[], None]
 RangeAction: TypeAlias = Callable[[int], bool]
 PanAction: TypeAlias = Callable[[int, int], bool]
-FrameData: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
+ClassMasks: TypeAlias = dict[int, np.ndarray]
+FrameData: TypeAlias = tuple[np.ndarray, ClassMasks]
 FrameCache: TypeAlias = dict[str, FrameData]
 FrameFuture: TypeAlias = dict[str, Future[FrameData]]
+
+
+def text_input_has_focus() -> bool:
+    """Return True while the user is typing or editing a numeric text field."""
+    focus = QtWidgets.QApplication.focusWidget()
+    return isinstance(
+        focus,
+        (
+            QtWidgets.QLineEdit,
+            QtWidgets.QTextEdit,
+            QtWidgets.QPlainTextEdit,
+            QtWidgets.QAbstractSpinBox,
+        ),
+    )
+
+
+def validate_class_definitions() -> None:
+    if not CLASS_DEFINITIONS:
+        raise ValueError("CLASS_DEFINITIONS must contain at least one class")
+    for class_id, definition in CLASS_DEFINITIONS.items():
+        if not isinstance(class_id, int) or not 1 <= class_id <= 255:
+            raise ValueError("Each class ID must be an integer between 1 and 255")
+        if not str(definition.get("name", "")).strip():
+            raise ValueError(f"Class {class_id} must have a non-empty name")
+        color = definition.get("color")
+        if not isinstance(color, tuple) or len(color) != 4:
+            raise ValueError(f"Class {class_id} color must be an RGBA tuple")
+
+
+def default_class_color(class_id: int) -> tuple[float, float, float, float]:
+    palette = (
+        (0.0, 1.0, 0.0, 1.0),
+        (1.0, 0.0, 1.0, 1.0),
+        (1.0, 1.0, 0.0, 1.0),
+        (0.0, 0.7, 1.0, 1.0),
+        (1.0, 0.4, 0.0, 1.0),
+        (0.6, 0.3, 1.0, 1.0),
+    )
+    return palette[(class_id - 1) % len(palette)]
+
+
+def register_mask_class_ids(values: np.ndarray) -> None:
+    """Register IDs found in an existing mask without merging or discarding them."""
+    for value in np.unique(values):
+        class_id = int(value)
+        if class_id == 0 or class_id in CLASS_DEFINITIONS:
+            continue
+        if not 1 <= class_id <= 255:
+            raise ValueError(f"Mask contains unsupported class ID: {class_id}")
+        CLASS_DEFINITIONS[class_id] = {
+            "name": f"class_{class_id}",
+            "color": default_class_color(class_id),
+        }
+
+
+def load_dataset_class_definitions(dataset_root: Path) -> None:
+    """Restore classes already recorded in a dataset before opening its masks."""
+    metadata_path = dataset_root / "classes.json"
+    if not metadata_path.is_file():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    for item in metadata.get("classes", []):
+        try:
+            class_id = int(item["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 1 <= class_id <= 255:
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        color = item.get("color_rgba", default_class_color(class_id))
+        if not isinstance(color, (list, tuple)) or len(color) != 4:
+            color = default_class_color(class_id)
+        existing = CLASS_DEFINITIONS.get(class_id)
+        if existing is not None:
+            existing_name = str(existing.get("name") or "").strip()
+            # Preserve a meaningful name already loaded from the destination,
+            # but replace empty/automatic placeholders with dataset metadata.
+            if existing_name and existing_name != f"class_{class_id}":
+                continue
+        CLASS_DEFINITIONS[class_id] = {
+            "name": name,
+            "color": tuple(float(channel) for channel in color),
+        }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -107,17 +201,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "input_path",
         nargs="?",
-        help="Image file, image folder, or video file path. Defaults to INPUT_PATH in this file.",
+        help="Original image file/folder or video. Defaults to ORIGINAL_IMAGE_INPUT_PATH.",
     )
     parser.add_argument(
-        "--mask-dir",
-        dest="mask_dir",
-        help="Mask directory to use when the input is an image folder.",
+        "--pseudo-mask", "--mask-dir",
+        dest="pseudo_mask",
+        help="Optional pseudo-mask file or directory used to initialize new masks.",
     )
     parser.add_argument(
-        "--output-root",
-        dest="output_root",
-        help="Root directory for extracted video frames and masks.",
+        "--dataset-output", "--output-root",
+        dest="dataset_output",
+        help="Parent directory where a YYYYMMDD_HHMM dataset folder is created.",
     )
     parser.add_argument(
         "--fps",
@@ -136,10 +230,19 @@ def _optional_path(value: str | Path | None) -> Path | None:
 
 def resolve_runtime_paths(argv: list[str] | None = None) -> tuple[Path, Path | None, Path | None, float | None]:
     args = parse_args(argv)
-    input_path = _optional_path(args.input_path) or INPUT_PATH
-    mask_dir = _optional_path(args.mask_dir) if args.mask_dir is not None else MASK_DIR
-    output_root = _optional_path(args.output_root) if args.output_root is not None else AUTO_OUTPUT_ROOT
-    return Path(input_path).expanduser(), mask_dir, output_root, args.fps
+    input_path = _optional_path(args.input_path) or ORIGINAL_IMAGE_INPUT_PATH
+    pseudo_mask = (
+        _optional_path(args.pseudo_mask)
+        if args.pseudo_mask is not None
+        else PSEUDO_MASK_INPUT_PATH
+    )
+    dataset_parent = (
+        _optional_path(args.dataset_output)
+        if args.dataset_output is not None
+        else DATASET_OUTPUT_PARENT_PATH
+    )
+    dataset_output = Path(dataset_parent).expanduser() / DATASET_SESSION_NAME
+    return Path(input_path).expanduser(), pseudo_mask, dataset_output, args.fps
 
 
 def list_images(folder: Path, exts: set[str]) -> dict[str, Path]:
@@ -157,14 +260,53 @@ def load_rgb(path: Path) -> np.ndarray:
     return img
 
 
-def load_mask255_as_bin01(mask_path: Path, shape_hw: tuple[int, int]) -> np.ndarray:
-    """0/255 마스크 -> 0/1"""
+def load_multiclass_mask(mask_path: Path, shape_hw: tuple[int, int]) -> np.ndarray:
+    """Load a configured multi-class mask; treat legacy nonzero masks as class 1."""
     m = iio.imread(mask_path)
     if m.ndim == 3:
         m = m[..., 0]
     if m.shape[:2] != shape_hw:
         raise ValueError(f"Shape mismatch: RGB {shape_hw} vs MASK {m.shape[:2]} ({mask_path.name})")
-    return (m > 0).astype(np.uint8)
+    mask = m.astype(np.uint8)
+    values = set(int(value) for value in np.unique(mask))
+    # Only the old binary 0/255 convention is converted to class 1. Other
+    # numeric IDs are preserved even when they are not configured yet.
+    if values.issubset({0, 255}) and 255 not in CLASS_DEFINITIONS:
+        return (mask > 0).astype(np.uint8)
+    return mask
+
+
+def compose_multiclass_mask(class_masks: Mapping[int, np.ndarray]) -> np.ndarray:
+    """Combine class layers into one mask; later class IDs win on overlap."""
+    if set(class_masks) != set(CLASS_DEFINITIONS):
+        raise ValueError("Class layer IDs do not match CLASS_DEFINITIONS")
+    shapes = {np.asarray(mask).shape for mask in class_masks.values()}
+    if len(shapes) != 1:
+        raise ValueError(f"Class-layer shape mismatch: {sorted(shapes)}")
+    mask = np.zeros(next(iter(class_masks.values())).shape, dtype=np.uint8)
+    for class_id in sorted(CLASS_DEFINITIONS):
+        mask[np.asarray(class_masks[class_id]) > 0] = class_id
+    return mask
+
+
+def colorize_multiclass_mask(mask: np.ndarray) -> np.ndarray:
+    """Create an RGB preview while preserving the indexed mask for training."""
+    preview = np.zeros((*mask.shape[:2], 3), dtype=np.uint8)
+    for class_id, definition in CLASS_DEFINITIONS.items():
+        rgba = np.asarray(definition["color"], dtype=float)
+        preview[np.asarray(mask) == class_id] = np.clip(
+            np.rint(rgba[:3] * 255), 0, 255
+        ).astype(np.uint8)
+    return preview
+
+
+def write_mask_preview(mask_path: Path, mask: np.ndarray) -> Path:
+    """Save a human-readable colour preview outside the training masks folder."""
+    preview_dir = mask_path.parent.parent / "mask_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_dir / mask_path.name
+    iio.imwrite(preview_path, colorize_multiclass_mask(mask))
+    return preview_path
 
 
 def loadFrame(
@@ -174,16 +316,14 @@ def loadFrame(
 ) -> FrameData:
     try:
         image = load_rgb(rgb_map[frame])
-        mask = load_mask255_as_bin01(mask_map[frame], image.shape[:2])
+        mask = load_multiclass_mask(mask_map[frame], image.shape[:2])
     except Exception as exc:
         raise RuntimeError(f"Frame load failed: {frame}") from exc
-    empty_mask = np.zeros_like(mask, dtype=np.uint8)
-    return image, mask, empty_mask
-
-
-def bin01_to_mask255(bin01: np.ndarray) -> np.ndarray:
-    """0/1 -> 0/255"""
-    return (np.asarray(bin01) > 0).astype(np.uint8) * 255
+    class_masks = {
+        class_id: (mask == class_id).astype(np.uint8)
+        for class_id in CLASS_DEFINITIONS
+    }
+    return image, class_masks
 
 
 def fillRegion(
@@ -578,6 +718,7 @@ def prepare_input_output(
         없으면 비디오를 프레임별 이미지로 자동 저장
     """
     input_path = Path(input_path).expanduser()
+    explicit_mask_path: Path | None = None
 
     if is_video_path(input_path):
         base_project_root = default_video_project_root(input_path, output_root)
@@ -603,6 +744,12 @@ def prepare_input_output(
         rgb_dir = input_path
         if mask_dir_override is not None:
             mask_dir = Path(mask_dir_override)
+            if mask_dir.is_file() or (
+                not mask_dir.exists() and mask_dir.suffix.lower() in MASK_EXTS
+            ):
+                raise ValueError(
+                    "MASK_DIR must be a directory when INPUT_PATH is an image directory"
+                )
         else:
             mask_dir = input_path.parent / f"{input_path.name}_masks"
         rgb_map = dict(sorted(list_images(rgb_dir, RGB_EXTS).items()))
@@ -612,7 +759,14 @@ def prepare_input_output(
         # A single image is handled as a one-frame labeling project.
         rgb_dir = input_path.parent
         if mask_dir_override is not None:
-            mask_dir = Path(mask_dir_override)
+            mask_location = Path(mask_dir_override)
+            if mask_location.is_file() or (
+                not mask_location.exists() and mask_location.suffix.lower() in MASK_EXTS
+            ):
+                explicit_mask_path = mask_location
+                mask_dir = mask_location.parent
+            else:
+                mask_dir = mask_location
         else:
             mask_dir = input_path.parent / f"{input_path.stem}_masks"
         rgb_map = {input_path.stem: input_path}
@@ -622,7 +776,14 @@ def prepare_input_output(
             f"{input_path}"
         )
 
-    mask_map = dict(sorted(ensure_mask_files_for_rgb(rgb_dir, mask_dir, rgb_map).items()))
+    if explicit_mask_path is not None:
+        explicit_mask_path.parent.mkdir(parents=True, exist_ok=True)
+        if not explicit_mask_path.exists():
+            rgb = load_rgb(input_path)
+            iio.imwrite(explicit_mask_path, np.zeros(rgb.shape[:2], dtype=np.uint8))
+        mask_map = {input_path.stem: explicit_mask_path}
+    else:
+        mask_map = dict(sorted(ensure_mask_files_for_rgb(rgb_dir, mask_dir, rgb_map).items()))
     keys = sorted(set(rgb_map.keys()) & set(mask_map.keys()))
     if not keys:
         raise RuntimeError(
@@ -634,19 +795,147 @@ def prepare_input_output(
     return rgb_dir, mask_dir, rgb_map, mask_map, keys
 
 
+def write_dataset_metadata(dataset_root: Path) -> Path:
+    """Write class metadata beside the standard images/ and masks/ folders."""
+    metadata = {
+        "format": "semantic-segmentation-indexed-png",
+        "images": "images",
+        "masks": "masks",
+        "mask_previews": "mask_previews (visualization only; do not use for training)",
+        "mask_dtype": "uint8",
+        "background": {"id": 0, "name": "background"},
+        "classes": [
+            {
+                "id": class_id,
+                "name": str(definition["name"]),
+                "color_rgba": list(definition["color"]),
+            }
+            for class_id, definition in sorted(CLASS_DEFINITIONS.items())
+        ],
+    }
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    metadata_path = dataset_root / "classes.json"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return metadata_path
+
+
+def _copy_source_image(source: Path, images_dir: Path) -> Path:
+    destination = images_dir / source.name
+    images_dir.mkdir(parents=True, exist_ok=True)
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
+    return destination
+
+
+def _pseudo_mask_map(
+    pseudo_mask_input: Path | None,
+    source_images: Mapping[str, Path],
+) -> dict[str, Path]:
+    if pseudo_mask_input is None:
+        return {}
+    pseudo_mask_input = Path(pseudo_mask_input).expanduser()
+    if pseudo_mask_input.is_file():
+        if len(source_images) != 1:
+            raise ValueError(
+                "A pseudo-mask file can only be used with one original image; "
+                "use a pseudo-mask directory for an image folder"
+            )
+        return {next(iter(source_images)): pseudo_mask_input}
+    if pseudo_mask_input.is_dir():
+        return dict(sorted(list_images(pseudo_mask_input, MASK_EXTS).items()))
+    raise FileNotFoundError(f"Cannot find pseudo-mask input: {pseudo_mask_input}")
+
+
+def prepare_segmentation_dataset(
+    input_path: Path,
+    pseudo_mask_input: Path | None,
+    dataset_output_root: Path | None,
+    video_fps: float | None = None,
+) -> tuple[Path, Path, dict[str, Path], dict[str, Path], list[str]]:
+    """Stage data as dataset/images + dataset/masks with matching file stems."""
+    input_path = Path(input_path).expanduser()
+
+    if is_video_path(input_path):
+        rgb_dir, mask_dir, rgb_map, mask_map, keys = prepare_input_output(
+            input_path,
+            mask_dir_override=None,
+            output_root=dataset_output_root,
+            video_fps=video_fps,
+        )
+        write_dataset_metadata(mask_dir.parent)
+        return rgb_dir, mask_dir, rgb_map, mask_map, keys
+
+    if input_path.is_file() and input_path.suffix.lower() in RGB_EXTS:
+        source_images = {input_path.stem: input_path}
+        default_root = input_path.parent / f"{input_path.stem}_dataset"
+    elif input_path.is_dir():
+        source_images = dict(sorted(list_images(input_path, RGB_EXTS).items()))
+        if not source_images:
+            raise RuntimeError(f"No readable images in input directory: {input_path}")
+        default_root = input_path.parent / f"{input_path.name}_dataset"
+    else:
+        raise FileNotFoundError(
+            f"Original input is not a supported image, image directory, or video: {input_path}"
+        )
+
+    dataset_root = Path(dataset_output_root or default_root).expanduser()
+    load_dataset_class_definitions(dataset_root)
+    # When the inputs come from another generated dataset, inherit its class
+    # names and colours into the new timestamped output folder.
+    if input_path.is_file() and input_path.parent.name == "images":
+        load_dataset_class_definitions(input_path.parent.parent)
+    if pseudo_mask_input is not None:
+        pseudo_path = Path(pseudo_mask_input).expanduser()
+        if pseudo_path.is_file() and pseudo_path.parent.name == "masks":
+            load_dataset_class_definitions(pseudo_path.parent.parent)
+    images_dir = dataset_root / "images"
+    masks_dir = dataset_root / "masks"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+
+    rgb_map = {
+        stem: _copy_source_image(source, images_dir)
+        for stem, source in source_images.items()
+    }
+    pseudo_masks = _pseudo_mask_map(pseudo_mask_input, source_images)
+    mask_map: dict[str, Path] = {}
+
+    for stem, image_path in rgb_map.items():
+        mask_path = masks_dir / f"{stem}.png"
+        image = load_rgb(image_path)
+        if not mask_path.exists():
+            pseudo_path = pseudo_masks.get(stem)
+            if pseudo_path is None:
+                initial_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            else:
+                initial_mask = load_multiclass_mask(pseudo_path, image.shape[:2])
+            iio.imwrite(mask_path, initial_mask.astype(np.uint8))
+        indexed_mask = load_multiclass_mask(mask_path, image.shape[:2])
+        register_mask_class_ids(indexed_mask)
+        write_mask_preview(mask_path, indexed_mask)
+        mask_map[stem] = mask_path
+
+    keys = sorted(rgb_map)
+    write_dataset_metadata(dataset_root)
+    return images_dir, masks_dir, rgb_map, mask_map, keys
+
+
 def prepare_input_output_checked(
     input_path: Path,
-    mask_dir_override: Path | None = None,
-    output_root: Path | None = None,
+    pseudo_mask_input: Path | None = None,
+    dataset_output_root: Path | None = None,
     video_fps: float | None = None,
 ) -> tuple[Path, Path, dict[str, Path], dict[str, Path], list[str]]:
     input_path = Path(input_path).expanduser()
     if not input_path.exists():
         raise FileNotFoundError(build_missing_input_message(input_path))
-    return prepare_input_output(
+    return prepare_segmentation_dataset(
         input_path,
-        mask_dir_override=mask_dir_override,
-        output_root=output_root,
+        pseudo_mask_input=pseudo_mask_input,
+        dataset_output_root=dataset_output_root,
         video_fps=video_fps,
     )
 
@@ -715,11 +1004,13 @@ class InputFilter(QtCore.QObject):
         if not self.checkWindow():
             return False
 
-        if event.type() == QtCore.QEvent.Type.KeyPress:
+        if event.type() == QtCore.QEvent.Type.KeyPress and isinstance(event, QtGui.QKeyEvent):
+            if text_input_has_focus():
+                return False
             return self.filterKey(event)
-        if event.type() == QtCore.QEvent.Type.Wheel:
+        if event.type() == QtCore.QEvent.Type.Wheel and isinstance(event, QtGui.QWheelEvent):
             return self.filterWheel(source, event)
-        if event.type() in {
+        if isinstance(event, QtGui.QMouseEvent) and event.type() in {
             QtCore.QEvent.Type.MouseButtonPress,
             QtCore.QEvent.Type.MouseMove,
             QtCore.QEvent.Type.MouseButtonRelease,
@@ -728,6 +1019,8 @@ class InputFilter(QtCore.QObject):
         return False
 
     def filterKey(self, event: QtCore.QEvent) -> bool:
+        if not isinstance(event, QtGui.QKeyEvent):
+            return False
         key_event = cast(QtGui.QKeyEvent, event)
         key_code = self.readKeyCode(key_event)
         if key_code in NEXT_KEY_CODES:
@@ -745,6 +1038,10 @@ class InputFilter(QtCore.QObject):
         source: QtCore.QObject,
         event: QtCore.QEvent,
     ) -> bool:
+        # Some Qt/napari event dispatch paths can report Wheel for a QKeyEvent.
+        # Do not cast blindly: only QWheelEvent provides angleDelta().
+        if not isinstance(event, QtGui.QWheelEvent):
+            return False
         if not self.checkCanvas(source):
             return False
 
@@ -767,6 +1064,8 @@ class InputFilter(QtCore.QObject):
         source: QtCore.QObject,
         event: QtCore.QEvent,
     ) -> bool:
+        if not isinstance(event, QtGui.QMouseEvent):
+            return False
         mouse_event = cast(QtGui.QMouseEvent, event)
         event_type = event.type()
 
@@ -819,9 +1118,13 @@ class InputFilter(QtCore.QObject):
             return False
 
         focus_widget = QtWidgets.QApplication.focusWidget()
-        if focus_widget is None:
-            return self.window.isActiveWindow()
-        return focus_widget is self.window or self.window.isAncestorOf(focus_widget)
+        try:
+            if focus_widget is None:
+                return self.window.isActiveWindow()
+            return focus_widget is self.window or self.window.isAncestorOf(focus_widget)
+        except RuntimeError:
+            # Qt may deliver a final event while the window is being destroyed.
+            return False
 
     def checkCanvas(self, source: QtCore.QObject) -> bool:
         if self.canvas is None:
@@ -865,11 +1168,12 @@ class InputFilter(QtCore.QObject):
 
 
 def main(argv: list[str] | None = None) -> None:
-    input_path, mask_dir_override, output_root, video_fps = resolve_runtime_paths(argv)
+    validate_class_definitions()
+    input_path, pseudo_mask_input, dataset_output_root, video_fps = resolve_runtime_paths(argv)
     rgb_dir, mask_dir, rgb_map, mask_map, keys = prepare_input_output_checked(
         input_path,
-        mask_dir_override=mask_dir_override,
-        output_root=output_root,
+        pseudo_mask_input=pseudo_mask_input,
+        dataset_output_root=dataset_output_root,
         video_fps=video_fps,
     )
 
@@ -882,32 +1186,26 @@ def main(argv: list[str] | None = None) -> None:
         "dirty": False,
         "suspend": False,
 
-        "active": "L1",
+        "active": next(iter(CLASS_DEFINITIONS)),
         "label": 1,
-
-        "L1_b0": 100,
-        "L1_b1": 60,
-        "L2_b0": 100,
-        "L2_b1": 60,
-
-        "opacity_L1": 0.85,
-        "opacity_L2": 0.65,
+        "brush_b0": 100,
+        "brush_b1": 60,
         "zoom": 1.0,
         "tool_mode": "paint",
-
-        "vis_L1": True,
-        "vis_L2": True,
 
         # ✅ 실행(세션) 전체에서 누적되는 저장 카운터
         "save_idx": 0,
     }
+    for class_id in CLASS_DEFINITIONS:
+        state[f"class_{class_id}_opacity"] = 0.85
+        state[f"class_{class_id}_visible"] = True
 
     frame_cache: FrameCache = {}
     frame_futures: FrameFuture = {}
     frame_lock = Lock()
     frame_executor = ThreadPoolExecutor(max_workers=2)
 
-    viewer = napari.Viewer(title="Mask Editor (L1/L2 separate layers)")
+    viewer = napari.Viewer(title="Multi-class Mask Editor")
     autosave_timer = QtCore.QTimer(viewer.window._qt_window)
     autosave_timer.setSingleShot(True)
     autosave_timer.setInterval(AUTOSAVE_DELAY_MS)
@@ -916,25 +1214,19 @@ def main(argv: list[str] | None = None) -> None:
     mask_snapshot: np.ndarray | None = None
 
     img_layer = None
-    l1_layer = None
-    l2_layer = None
-
-    hist_L1 = History(MAX_HISTORY)
-    hist_L2 = History(MAX_HISTORY)
+    class_layers: dict[int, object] = {}
+    histories = {class_id: History(MAX_HISTORY) for class_id in CLASS_DEFINITIONS}
 
     # UI refs
     page_title = None
     page_slider = None
     page_spin = None
-    btnL1 = btnL2 = None
+    class_buttons: dict[int, QtWidgets.QPushButton] = {}
     btnBG = btnFG = None
     btnPaint = btnFill = btnPan = None
-    visL1_btn = visL2_btn = None
-
-    s_L1_0 = sp_L1_0 = None
-    s_L1_1 = sp_L1_1 = None
-    s_L2_0 = sp_L2_0 = None
-    s_L2_1 = sp_L2_1 = None
+    visibility_buttons: dict[int, QtWidgets.QPushButton] = {}
+    brush_controls: dict[int, tuple[QtWidgets.QSlider, QtWidgets.QSpinBox]] = {}
+    class_summary_label: QtWidgets.QLabel | None = None
 
     zoom_slider = None
     zoom_spin = None
@@ -1023,16 +1315,21 @@ def main(argv: list[str] | None = None) -> None:
                 cacheFrame(keys[item])
 
     def active_layer_obj():
-        return l1_layer if state["active"] == "L1" else l2_layer
+        return class_layers.get(int(state["active"]))
 
     def set_window_title(extra: str = ""):
         try:
             k = keys[state["idx"]]
             star = " *" if state["dirty"] else ""
+            class_state = " ".join(
+                f"{CLASS_DEFINITIONS[class_id]['name']}"
+                f"(vis={int(state[f'class_{class_id}_visible'])})"
+                for class_id in CLASS_DEFINITIONS
+            )
             base = (
                 f"[ACTIVE={state['active']} label={state['label']} tool={state['tool_mode']}] "
-                f"L1(b0={state['L1_b0']},b1={state['L1_b1']},vis={int(state['vis_L1'])}) "
-                f"L2(b0={state['L2_b0']},b1={state['L2_b1']},vis={int(state['vis_L2'])}) "
+                f"{class_state} "
+                f"brush(erase={state['brush_b0']},paint={state['brush_b1']}) "
                 f"zoom={state['zoom']:.2f} "
                 f"- [{state['idx']+1}/{len(keys)}] {k}{star}"
             )
@@ -1049,7 +1346,7 @@ def main(argv: list[str] | None = None) -> None:
         if page_title is None:
             return
         v = state["idx"] + 1
-        page_title.setText(f"Page  {v}/{len(keys)}" + ("  *unsaved(L1)" if state["dirty"] else ""))
+        page_title.setText(f"Page  {v}/{len(keys)}" + ("  *unsaved" if state["dirty"] else ""))
         page_slider.blockSignals(True)
         page_spin.blockSignals(True)
         page_slider.setValue(v)
@@ -1067,66 +1364,73 @@ def main(argv: list[str] | None = None) -> None:
         set_window_title()
 
     def apply_colormaps():
-        if l1_layer is not None:
-            cmap1 = DirectLabelColormap(
-                color_dict={None:(0,0,0,0), 0:(0,0,0,0), 1:(0.0,1.0,0.0,1.0)}
+        for class_id, layer in class_layers.items():
+            color = CLASS_DEFINITIONS[class_id]["color"]
+            cmap = DirectLabelColormap(
+                color_dict={None: (0, 0, 0, 0), 0: (0, 0, 0, 0), 1: color}
             )
-            l1_layer.colormap = cmap1
-            l1_layer.opacity = float(np.clip(state["opacity_L1"], 0.0, 1.0))
+            layer.colormap = cmap
+            layer.opacity = float(np.clip(state[f"class_{class_id}_opacity"], 0.0, 1.0))
             try:
-                l1_layer.blending = "translucent"
+                layer.blending = "translucent"
             except Exception:
                 pass
-            l1_layer.visible = bool(state["vis_L1"])
-
-        if l2_layer is not None:
-            cmap2 = DirectLabelColormap(
-                color_dict={None:(0,0,0,0), 0:(0,0,0,0), 1:(1.0,0.0,1.0,1.0)}
-            )
-            l2_layer.colormap = cmap2
-            l2_layer.opacity = float(np.clip(state["opacity_L2"], 0.0, 1.0))
-            try:
-                l2_layer.blending = "translucent"
-            except Exception:
-                pass
-            l2_layer.visible = bool(state["vis_L2"])
+            layer.visible = bool(state[f"class_{class_id}_visible"])
             try:
                 layers = viewer.layers
-                i = layers.index(l2_layer)
+                i = layers.index(layer)
                 layers.move(i, len(layers) - 1)
             except Exception:
                 pass
 
-    def _l1_opacity_changed(_event=None):
-        if state["suspend"] or l1_layer is None:
+    def _class_opacity_changed(class_id: int, _event=None):
+        layer = class_layers.get(class_id)
+        if state["suspend"] or layer is None:
             return
-        state["opacity_L1"] = float(np.clip(l1_layer.opacity, 0.0, 1.0))
+        state[f"class_{class_id}_opacity"] = float(np.clip(layer.opacity, 0.0, 1.0))
         set_window_title()
 
-    def _l2_opacity_changed(_event=None):
-        if state["suspend"] or l2_layer is None:
+    def _class_visible_changed(class_id: int, _event=None):
+        layer = class_layers.get(class_id)
+        if state["suspend"] or layer is None:
             return
-        state["opacity_L2"] = float(np.clip(l2_layer.opacity, 0.0, 1.0))
-        set_window_title()
-
-    def _l1_visible_changed(_event=None):
-        if state["suspend"] or l1_layer is None:
-            return
-        state["vis_L1"] = bool(l1_layer.visible)
+        state[f"class_{class_id}_visible"] = bool(layer.visible)
         sync_buttons()
         set_window_title()
 
-    def _l2_visible_changed(_event=None):
-        if state["suspend"] or l2_layer is None:
+    def refresh_class_name_ui(class_id: int) -> None:
+        name = str(CLASS_DEFINITIONS[class_id]["name"])
+        button = class_buttons.get(class_id)
+        if button is not None:
+            button.setText(f"Active: {name} ({class_id})")
+        visibility_button = visibility_buttons.get(class_id)
+        if visibility_button is not None:
+            visibility_button.setText(f"Show {name}")
+        if class_summary_label is not None:
+            summary = ", ".join(
+                f"{cid}={definition['name']}"
+                for cid, definition in CLASS_DEFINITIONS.items()
+            )
+            class_summary_label.setText(f"Saved mask values: background=0, {summary}.")
+
+    def _class_name_changed(class_id: int, _event=None) -> None:
+        """Keep user-entered Napari layer names in the class UI for this session."""
+        layer = class_layers.get(class_id)
+        if layer is None:
             return
-        state["vis_L2"] = bool(l2_layer.visible)
-        sync_buttons()
+        name = str(layer.name).strip()
+        default_suffix = f" (class {class_id})"
+        if name.endswith(default_suffix):
+            name = name[: -len(default_suffix)].strip()
+        if not name:
+            return
+        CLASS_DEFINITIONS[class_id]["name"] = name
+        refresh_class_name_ui(class_id)
+        write_dataset_metadata(mask_dir.parent)
         set_window_title()
 
     def apply_tool_mode():
         layer = active_layer_obj()
-        if state["tool_mode"] == "fill":
-            layer = l1_layer
         if layer is None:
             return
         try:
@@ -1141,8 +1445,8 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             pass
 
-    def brush_value_for(active: str, lbl: int) -> int:
-        return int(state[f"{active}_b{lbl}"])
+    def brush_value_for(lbl: int) -> int:
+        return int(state[f"brush_b{lbl}"])
 
     def remember_current_brush_size():
         if state.get("suspend"):
@@ -1155,13 +1459,13 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             return
         v = int(np.clip(v, BRUSH_MIN, BRUSH_MAX))
-        state[f"{state['active']}_b{state['label']}"] = v
+        state[f"brush_b{state['label']}"] = v
         sync_brush_ui()
 
-    def set_brush_value_for(active: str, lbl: int, v: int):
+    def set_brush_value_for(lbl: int, v: int):
         v = int(np.clip(int(v), BRUSH_MIN, BRUSH_MAX))
-        state[f"{active}_b{lbl}"] = v
-        if state["active"] == active and state["label"] == lbl:
+        state[f"brush_b{lbl}"] = v
+        if state["label"] == lbl:
             layer = active_layer_obj()
             if layer is not None:
                 try:
@@ -1174,11 +1478,10 @@ def main(argv: list[str] | None = None) -> None:
         if state.get("tool_mode") == "pan_zoom":
             return False
 
-        layer_name = str(state["active"])
         label = int(state["label"])
         delta = BRUSH_WHEEL_STEP if direction > 0 else -BRUSH_WHEEL_STEP
-        size = int(brush_value_for(layer_name, label)) + delta
-        set_brush_value_for(layer_name, label, size)
+        size = brush_value_for(label) + delta
+        set_brush_value_for(label, size)
         sync_brush_ui()
         return True
 
@@ -1211,9 +1514,8 @@ def main(argv: list[str] | None = None) -> None:
         return True
 
     def sync_buttons():
-        if btnL1 is not None:
-            btnL1.setChecked(state["active"] == "L1")
-            btnL2.setChecked(state["active"] == "L2")
+        for class_id, button in class_buttons.items():
+            button.setChecked(state["active"] == class_id)
         if btnBG is not None:
             btnBG.setChecked(state["label"] == 0)
             btnFG.setChecked(state["label"] == 1)
@@ -1221,24 +1523,15 @@ def main(argv: list[str] | None = None) -> None:
             btnPaint.setChecked(state["tool_mode"] == "paint")
         if btnFill is not None:
             btnFill.setChecked(state["tool_mode"] == "fill")
-        if visL1_btn is not None:
-            visL1_btn.setChecked(state["vis_L1"])
-            visL2_btn.setChecked(state["vis_L2"])
+        for class_id, button in visibility_buttons.items():
+            button.setChecked(state[f"class_{class_id}_visible"])
 
     def sync_brush_ui():
-        if s_L1_0 is None:
-            return
-        pairs = [
-            (s_L1_0, sp_L1_0, "L1_b0"),
-            (s_L1_1, sp_L1_1, "L1_b1"),
-            (s_L2_0, sp_L2_0, "L2_b0"),
-            (s_L2_1, sp_L2_1, "L2_b1"),
-        ]
-        for s, sp, key in pairs:
-            v = int(state[key])
-            s.blockSignals(True); sp.blockSignals(True)
-            s.setValue(v); sp.setValue(v)
-            s.blockSignals(False); sp.blockSignals(False)
+        for label, (slider, spinbox) in brush_controls.items():
+            v = brush_value_for(label)
+            slider.blockSignals(True); spinbox.blockSignals(True)
+            slider.setValue(v); spinbox.setValue(v)
+            slider.blockSignals(False); spinbox.blockSignals(False)
 
     def apply_active_state_to_layer():
         layer = active_layer_obj()
@@ -1250,7 +1543,7 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             pass
         try:
-            layer.brush_size = int(brush_value_for(state["active"], state["label"]))
+            layer.brush_size = brush_value_for(int(state["label"]))
         except Exception:
             pass
         sync_buttons()
@@ -1260,30 +1553,32 @@ def main(argv: list[str] | None = None) -> None:
         sync_brush_ui()
         apply_active_state_to_layer()
 
-    def _label_layer_brush_size_changed(layer_name: str):
+    def _label_layer_brush_size_changed(class_id: int):
         if state.get("suspend"):
             return
-        layer = l1_layer if layer_name == "L1" else l2_layer
+        layer = class_layers.get(class_id)
         if layer is None:
             return
-        if state.get("active") != layer_name:
+        if state.get("active") != class_id:
             return
         try:
             v = int(round(float(layer.brush_size)))
         except Exception:
             return
         v = int(np.clip(v, BRUSH_MIN, BRUSH_MAX))
-        state[f"{layer_name}_b{state['label']}"] = v
+        state[f"brush_b{state['label']}"] = v
         sync_brush_ui()
         set_window_title()
 
-    def fill_l1_at_current_point(position) -> bool:
-        if l1_layer is None:
+    def fill_active_class_at_current_point(position) -> bool:
+        class_id = int(state["active"])
+        layer = class_layers.get(class_id)
+        if layer is None:
             return False
         if position is None or len(position) < 2:
             return False
 
-        data = np.asarray(l1_layer.data)
+        data = np.asarray(layer.data)
         y = int(round(float(position[0])))
         x = int(round(float(position[1])))
         if not (0 <= y < data.shape[0] and 0 <= x < data.shape[1]):
@@ -1293,31 +1588,144 @@ def main(argv: list[str] | None = None) -> None:
         if np.array_equal(filled, data):
             return False
 
-        hist_L1.push(data)
-        hist_L1.suspend = True
+        history = histories[class_id]
+        history.push(data)
+        history.suspend = True
         try:
-            l1_layer.data = filled.astype(np.uint8)
+            layer.data = filled.astype(np.uint8)
         finally:
-            hist_L1.suspend = False
+            history.suspend = False
 
-        markChange("L1")
+        markChange(f"class {class_id}")
         apply_colormaps()
         refresh_page_ui()
-        set_window_title(extra=f"(L1 fill @ x={x}, y={y}, label={state['label']})")
+        set_window_title(extra=f"(class {class_id} fill @ x={x}, y={y}, label={state['label']})")
         return True
 
-    def on_l1_mouse_drag(layer, event):
+    def on_class_mouse_drag(layer, event):
         if state.get("tool_mode") != "fill":
             return
-        filled = fill_l1_at_current_point(getattr(event, "position", None))
+        filled = fill_active_class_at_current_point(getattr(event, "position", None))
         if filled:
             event.handled = True
         return
 
-    def set_active_layer(name: str, *_args):
+    def set_active_layer(class_id: int, *_args):
+        class_id = int(class_id)
+        if class_id not in CLASS_DEFINITIONS:
+            return
         remember_current_brush_size()
-        state["active"] = "L1" if str(name).upper() == "L1" else "L2"
+        state["active"] = class_id
         apply_active_state_to_layer()
+        sync_brush_ui()
+
+    def _viewer_active_layer_changed(event=None) -> None:
+        """Synchronize state when a class is selected in Napari's layer list."""
+        selected_layer = getattr(event, "value", None)
+        if selected_layer is None:
+            selected_layer = viewer.layers.selection.active
+        selected_class_id = next(
+            (
+                class_id
+                for class_id, layer in class_layers.items()
+                if layer is selected_layer
+            ),
+            None,
+        )
+        if selected_class_id is None or selected_class_id == state["active"]:
+            return
+        remember_current_brush_size()
+        state["active"] = selected_class_id
+        apply_active_state_to_layer()
+        sync_brush_ui()
+
+    viewer.layers.selection.events.active.connect(_viewer_active_layer_changed)
+
+    def connect_class_layer_events(class_id: int, layer) -> None:
+        layer.events.data.connect(
+            lambda _event=None, cid=class_id: markChange(f"class {cid}")
+        )
+        layer.events.paint.connect(
+            lambda _event=None, cid=class_id: markChange(f"class {cid}")
+        )
+        layer.events.opacity.connect(
+            lambda _event=None, cid=class_id: _class_opacity_changed(cid)
+        )
+        layer.events.visible.connect(
+            lambda _event=None, cid=class_id: _class_visible_changed(cid)
+        )
+        layer.events.name.connect(
+            lambda _event=None, cid=class_id: _class_name_changed(cid)
+        )
+        layer.events.brush_size.connect(
+            lambda _event=None, cid=class_id: _label_layer_brush_size_changed(cid)
+        )
+        layer.mouse_drag_callbacks.append(on_class_mouse_drag)
+
+    def add_new_class(*_args) -> None:
+        if img_layer is None:
+            return
+        class_id = max(CLASS_DEFINITIONS, default=0) + 1
+        if class_id > 255:
+            QtWidgets.QMessageBox.warning(
+                viewer.window._qt_window,
+                "Class limit",
+                "A uint8 segmentation mask supports class IDs only up to 255.",
+            )
+            return
+        name, accepted = QtWidgets.QInputDialog.getText(
+            viewer.window._qt_window,
+            "Add class",
+            f"Name for class {class_id}:",
+            text=f"class_{class_id}",
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+
+        CLASS_DEFINITIONS[class_id] = {
+            "name": name,
+            "color": default_class_color(class_id),
+        }
+        state[f"class_{class_id}_opacity"] = 0.85
+        state[f"class_{class_id}_visible"] = True
+        histories[class_id] = History(MAX_HISTORY)
+
+        state["suspend"] = True
+        try:
+            layer = viewer.add_labels(
+                np.zeros(img_layer.data.shape[:2], dtype=np.uint8),
+                name=f"{name} (class {class_id})",
+            )
+            class_layers[class_id] = layer
+            connect_class_layer_events(class_id, layer)
+        finally:
+            state["suspend"] = False
+
+        class_button = QtWidgets.QPushButton(f"Active: {name} ({class_id})")
+        class_button.setCheckable(True)
+        grp_layer.addButton(class_button)
+        class_button.clicked.connect(
+            lambda _checked=False, cid=class_id: set_active_layer(cid)
+        )
+        class_buttons[class_id] = class_button
+        layer_row.addWidget(class_button)
+
+        visibility_button = QtWidgets.QPushButton(f"Show {name}")
+        visibility_button.setCheckable(True)
+        visibility_button.setChecked(True)
+        visibility_button.toggled.connect(
+            lambda checked, cid=class_id: toggle_class_visibility(cid, checked)
+        )
+        visibility_buttons[class_id] = visibility_button
+        vis_row.addWidget(visibility_button)
+
+        if class_id <= 12:
+            bindMany([f"F{class_id}"], lambda cid=class_id: set_active_layer(cid))
+        refresh_class_name_ui(class_id)
+        write_dataset_metadata(mask_dir.parent)
+        apply_colormaps()
+        set_active_layer(class_id)
 
     def set_selected_label(lbl: int, *_args):
         # Store the current tool's size before switching.  The new tool then
@@ -1332,8 +1740,6 @@ def main(argv: list[str] | None = None) -> None:
         if normalized not in {"paint", "pan_zoom", "fill"}:
             normalized = "paint"
         state["tool_mode"] = normalized
-        if normalized == "fill":
-            state["active"] = "L1"
         apply_active_state_to_layer()
 
     def toggle_tool_mode(*_args):
@@ -1387,39 +1793,41 @@ def main(argv: list[str] | None = None) -> None:
     # ======================
     def syncMaskSnapshot() -> None:
         nonlocal mask_snapshot
-        if l1_layer is None:
+        if set(class_layers) != set(CLASS_DEFINITIONS):
             mask_snapshot = None
             return
-        mask_snapshot = np.asarray(l1_layer.data).copy()
+        mask_snapshot = compose_multiclass_mask(
+            {class_id: layer.data for class_id, layer in class_layers.items()}
+        )
 
     def checkMaskChange() -> bool:
-        if l1_layer is None:
+        if set(class_layers) != set(CLASS_DEFINITIONS):
             return False
         if mask_snapshot is None:
             return False
 
-        mask_data = np.asarray(l1_layer.data)
+        mask_data = compose_multiclass_mask(
+            {class_id: layer.data for class_id, layer in class_layers.items()}
+        )
         shape_match = mask_data.shape == mask_snapshot.shape
         data_match = shape_match and np.array_equal(mask_data, mask_snapshot)
         return not data_match
 
     def scanMaskChange() -> None:
-        if state["suspend"] or l1_layer is None:
+        if state["suspend"] or set(class_layers) != set(CLASS_DEFINITIONS):
             return
         if mask_snapshot is None:
             syncMaskSnapshot()
             return
         if not checkMaskChange():
             return
-        markChange("L1")
+        markChange("multi-class mask")
 
     def scheduleAutosave() -> None:
         autosave_timer.start(AUTOSAVE_DELAY_MS)
 
     def markChange(layer: str) -> None:
         if state["suspend"]:
-            return
-        if layer != "L1":
             return
         state["dirty"] = True
         syncMaskSnapshot()
@@ -1431,15 +1839,19 @@ def main(argv: list[str] | None = None) -> None:
     # IO / navigation
     # ======================
     def writeMask() -> Path | None:
-        if l1_layer is None:
+        if set(class_layers) != set(CLASS_DEFINITIONS):
             return None
         frame_key = keys[state["idx"]]
         mask_path = mask_map[frame_key]
-        mask_data = bin01_to_mask255(np.asarray(l1_layer.data))
+        mask_data = compose_multiclass_mask(
+            {class_id: layer.data for class_id, layer in class_layers.items()}
+        )
         try:
             iio.imwrite(mask_path, mask_data)
+            write_mask_preview(mask_path, mask_data)
         except Exception as exc:
             raise RuntimeError(f"Mask save failed: {mask_path}") from exc
+        write_dataset_metadata(mask_dir.parent)
         dropFrame(frame_key)
         syncMaskSnapshot()
         state["dirty"] = False
@@ -1456,7 +1868,7 @@ def main(argv: list[str] | None = None) -> None:
         state["save_idx"] += 1
         log_append(f"Saved {state['save_idx']}: {mask_path.name}")
 
-        set_window_title(extra=f"(saved L1 only: {mask_path.name})")
+        set_window_title(extra=f"(saved classes 1/2: {mask_path.name})")
         refresh_page_ui()
 
     def flushAutosave(alert: bool = False) -> bool:
@@ -1477,14 +1889,15 @@ def main(argv: list[str] | None = None) -> None:
             return False
 
     def openFrame() -> None:
-        nonlocal img_layer, l1_layer, l2_layer
+        nonlocal img_layer
 
         if autosave_timer.isActive():
             autosave_timer.stop()
         k = keys[state["idx"]]
-        rgb, l1, l2 = readFrame(k)
+        rgb, class_masks = readFrame(k)
 
-        hist_L1.clear(); hist_L2.clear()
+        for history in histories.values():
+            history.clear()
 
         state["suspend"] = True
         try:
@@ -1496,29 +1909,17 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 img_layer.data = rgb
 
-            if l1_layer is None:
-                l1_layer = viewer.add_labels(l1, name="L1 (main/save)")
-                l1_layer.events.data.connect(lambda _event=None: markChange("L1"))
-                l1_layer.events.paint.connect(lambda _event=None: markChange("L1"))
-                l1_layer.events.opacity.connect(_l1_opacity_changed)
-                l1_layer.events.visible.connect(_l1_visible_changed)
-                l1_layer.events.brush_size.connect(lambda _event=None: _label_layer_brush_size_changed("L1"))
-                l1_layer.mouse_drag_callbacks.append(on_l1_mouse_drag)
-            else:
-                l1_layer.data = l1
-
-            if l2_layer is None:
-                l2_layer = viewer.add_labels(l2, name="L2 (temp)")
-                try:
-                    l2_layer.editable = True
-                except Exception:
-                    pass
-                l2_layer.events.data.connect(lambda _event=None: markChange("L2"))
-                l2_layer.events.opacity.connect(_l2_opacity_changed)
-                l2_layer.events.visible.connect(_l2_visible_changed)
-                l2_layer.events.brush_size.connect(lambda _event=None: _label_layer_brush_size_changed("L2"))
-            else:
-                l2_layer.data = l2
+            for class_id, definition in CLASS_DEFINITIONS.items():
+                layer = class_layers.get(class_id)
+                if layer is None:
+                    layer = viewer.add_labels(
+                        class_masks[class_id],
+                        name=f"{definition['name']} (class {class_id})",
+                    )
+                    class_layers[class_id] = layer
+                    connect_class_layer_events(class_id, layer)
+                else:
+                    layer.data = class_masks[class_id]
         finally:
             state["suspend"] = False
 
@@ -1544,7 +1945,7 @@ def main(argv: list[str] | None = None) -> None:
             LOGGER.exception("Open frame failed")
 
     def autosaveBeforeNavigation() -> bool:
-        if l1_layer is None:
+        if not class_layers:
             return True
         scanMaskChange()
         if autosave_timer.isActive():
@@ -1568,45 +1969,49 @@ def main(argv: list[str] | None = None) -> None:
     # ======================
     # ops
     # ======================
-    def copy_prev_to_l2(*_args):
-        if img_layer is None or l2_layer is None:
+    def copy_previous_to_active_class(*_args):
+        class_id = int(state["active"])
+        layer = class_layers.get(class_id)
+        if img_layer is None or layer is None:
             return
         prev_idx = (state["idx"] - 1) % len(keys)
         prev_key = keys[prev_idx]
-        prev_bin = load_mask255_as_bin01(mask_map[prev_key], img_layer.data.shape[:2])
+        prev_mask = load_multiclass_mask(mask_map[prev_key], img_layer.data.shape[:2])
 
-        hist_L2.push(np.asarray(l2_layer.data))
-        hist_L2.suspend = True
+        history = histories[class_id]
+        history.push(np.asarray(layer.data))
+        history.suspend = True
         try:
-            l2_layer.data = prev_bin.astype(np.uint8)
+            layer.data = (prev_mask == class_id).astype(np.uint8)
         finally:
-            hist_L2.suspend = False
+            history.suspend = False
 
+        markChange(f"class {class_id}")
         apply_colormaps()
-        set_window_title(extra=f"(copied prev {prev_key} -> L2)")
+        set_window_title(extra=f"(copied prev {prev_key} -> class {class_id})")
 
-    def merge_l1_l2_to_l1(*_args):
-        if l1_layer is None or l2_layer is None:
+    def convert_active_class_to_first(*_args):
+        """Move the active class into the first configured class."""
+        source_id = int(state["active"])
+        target_id = next(iter(CLASS_DEFINITIONS))
+        if source_id == target_id:
             return
-        hist_L1.push(np.asarray(l1_layer.data))
-        hist_L2.push(np.asarray(l2_layer.data))
-
-        l1 = (np.asarray(l1_layer.data) > 0)
-        l2 = (np.asarray(l2_layer.data) > 0)
-        merged = (l1 | l2).astype(np.uint8)
-
-        hist_L1.suspend = True
-        hist_L2.suspend = True
+        source = class_layers.get(source_id)
+        target = class_layers.get(target_id)
+        if source is None or target is None:
+            return
+        histories[source_id].push(np.asarray(source.data))
+        histories[target_id].push(np.asarray(target.data))
+        for history in (histories[source_id], histories[target_id]):
+            history.suspend = True
         try:
-            l1_layer.data = merged
-            l2_layer.data = np.zeros_like(merged, dtype=np.uint8)
+            target.data = ((np.asarray(target.data) > 0) | (np.asarray(source.data) > 0)).astype(np.uint8)
+            source.data = np.zeros_like(source.data, dtype=np.uint8)
         finally:
-            hist_L1.suspend = False
-            hist_L2.suspend = False
-
-        markChange("L1")
+            for history in (histories[source_id], histories[target_id]):
+                history.suspend = False
+        markChange(f"class {source_id}")
         apply_colormaps()
-        set_window_title(extra="(merged L2 into L1, cleared L2)")
         refresh_page_ui()
 
 
@@ -1648,7 +2053,8 @@ def main(argv: list[str] | None = None) -> None:
         state["mask_map"].pop(k, None)
         state["keys"].pop(old_idx)
 
-        hist_L1.clear(); hist_L2.clear()
+        for history in histories.values():
+            history.clear()
         state["dirty"] = False
 
         if old_idx >= len(state["keys"]):
@@ -1675,17 +2081,11 @@ def main(argv: list[str] | None = None) -> None:
     # ======================
     # visibility toggles
     # ======================
-    def toggle_vis_L1(checked: bool, *_args):
-        state["vis_L1"] = bool(checked)
-        if l1_layer is not None:
-            l1_layer.visible = bool(checked)
-        sync_buttons()
-        set_window_title()
-
-    def toggle_vis_L2(checked: bool, *_args):
-        state["vis_L2"] = bool(checked)
-        if l2_layer is not None:
-            l2_layer.visible = bool(checked)
+    def toggle_class_visibility(class_id: int, checked: bool, *_args):
+        state[f"class_{class_id}_visible"] = bool(checked)
+        layer = class_layers.get(class_id)
+        if layer is not None:
+            layer.visible = bool(checked)
         sync_buttons()
         set_window_title()
 
@@ -1696,11 +2096,6 @@ def main(argv: list[str] | None = None) -> None:
     L = QtWidgets.QVBoxLayout(dock)
     L.setContentsMargins(10, 10, 10, 10)
     L.setSpacing(10)
-
-    l2_dock = QtWidgets.QWidget()
-    L2P = QtWidgets.QVBoxLayout(l2_dock)
-    L2P.setContentsMargins(10, 10, 10, 10)
-    L2P.setSpacing(10)
 
     # Prev/Next
     nav = QtWidgets.QHBoxLayout()
@@ -1729,7 +2124,7 @@ def main(argv: list[str] | None = None) -> None:
     page_spin.valueChanged.connect(changePage)
 
     # Save
-    save_btn = QtWidgets.QPushButton("SAVE (L1 only)")
+    save_btn = QtWidgets.QPushButton("SAVE multi-class mask")
     save_btn.clicked.connect(saveMask)
     L.addWidget(save_btn)
 
@@ -1746,17 +2141,20 @@ def main(argv: list[str] | None = None) -> None:
     ur.addWidget(undo_btn); ur.addWidget(redo_btn)
     L.addLayout(ur)
 
-    # Active layer buttons
+    # Class buttons are created from CLASS_DEFINITIONS.
     layer_row = QtWidgets.QHBoxLayout()
-    btnL1 = QtWidgets.QPushButton("Active: L1")
-    btnL2 = QtWidgets.QPushButton("Active: L2")
-    btnL1.setCheckable(True); btnL2.setCheckable(True)
     grp_layer = QtWidgets.QButtonGroup()
     grp_layer.setExclusive(True)
-    grp_layer.addButton(btnL1); grp_layer.addButton(btnL2)
-    btnL1.clicked.connect(lambda *_: set_active_layer("L1"))
-    btnL2.clicked.connect(lambda *_: set_active_layer("L2"))
-    layer_row.addWidget(btnL1); layer_row.addWidget(btnL2)
+    for class_id, definition in CLASS_DEFINITIONS.items():
+        button = QtWidgets.QPushButton(f"Active: {definition['name']} ({class_id})")
+        button.setCheckable(True)
+        grp_layer.addButton(button)
+        button.clicked.connect(lambda _checked=False, cid=class_id: set_active_layer(cid))
+        class_buttons[class_id] = button
+        layer_row.addWidget(button)
+    add_class_button = QtWidgets.QPushButton("+ Add class")
+    add_class_button.clicked.connect(add_new_class)
+    layer_row.addWidget(add_class_button)
     L.addLayout(layer_row)
 
     tool_row = QtWidgets.QHBoxLayout()
@@ -1770,17 +2168,25 @@ def main(argv: list[str] | None = None) -> None:
     btnFill.clicked.connect(lambda *_: set_tool_mode("fill"))
     tool_row.addWidget(btnPaint); tool_row.addWidget(btnFill)
     L.addLayout(tool_row)
-    L.addWidget(QtWidgets.QLabel("Paint uses only L1 and treats label 1 as boundary."))
+    class_summary = ", ".join(
+        f"{class_id}={definition['name']}" for class_id, definition in CLASS_DEFINITIONS.items()
+    )
+    class_summary_label = QtWidgets.QLabel(
+        f"Saved mask values: background=0, {class_summary}."
+    )
+    L.addWidget(class_summary_label)
 
     # Visibility toggles
     vis_row = QtWidgets.QHBoxLayout()
-    visL1_btn = QtWidgets.QPushButton("Show L1")
-    visL2_btn = QtWidgets.QPushButton("Show L2")
-    visL1_btn.setCheckable(True); visL2_btn.setCheckable(True)
-    visL1_btn.setChecked(True); visL2_btn.setChecked(True)
-    visL1_btn.toggled.connect(toggle_vis_L1)
-    visL2_btn.toggled.connect(toggle_vis_L2)
-    vis_row.addWidget(visL1_btn); vis_row.addWidget(visL2_btn)
+    for class_id, definition in CLASS_DEFINITIONS.items():
+        button = QtWidgets.QPushButton(f"Show {definition['name']}")
+        button.setCheckable(True)
+        button.setChecked(True)
+        button.toggled.connect(
+            lambda checked, cid=class_id: toggle_class_visibility(cid, checked)
+        )
+        visibility_buttons[class_id] = button
+        vis_row.addWidget(button)
     L.addLayout(vis_row)
 
     # Label buttons (0/1)
@@ -1797,12 +2203,12 @@ def main(argv: list[str] | None = None) -> None:
     L.addLayout(label_row)
 
     # Ops
-    copy_btn = QtWidgets.QPushButton("Copy Prev → L2")
-    copy_btn.clicked.connect(copy_prev_to_l2)
+    copy_btn = QtWidgets.QPushButton("Copy previous → active class")
+    copy_btn.clicked.connect(copy_previous_to_active_class)
     L.addWidget(copy_btn)
 
-    merge_btn = QtWidgets.QPushButton("Merge L1+L2 → L1 (clear L2)")
-    merge_btn.clicked.connect(merge_l1_l2_to_l1)
+    merge_btn = QtWidgets.QPushButton("Convert active class → first class")
+    merge_btn.clicked.connect(convert_active_class_to_first)
     L.addWidget(merge_btn)
 
     # Brush blocks
@@ -1816,30 +2222,27 @@ def main(argv: list[str] | None = None) -> None:
         sp.setSingleStep(BRUSH_STEP)
         target_layout.addWidget(lbl); target_layout.addWidget(s); target_layout.addWidget(sp)
         s.setValue(init); sp.setValue(init)
-        return s, sp
+        return lbl, s, sp
 
-    s_L1_0, sp_L1_0 = add_brush_block(L, "L1 brush for label 0", state["L1_b0"])
-    s_L1_1, sp_L1_1 = add_brush_block(L, "L1 brush for label 1", state["L1_b1"])
-    L2P.addWidget(QtWidgets.QLabel("L2 Brush"))
-    s_L2_0, sp_L2_0 = add_brush_block(L2P, "L2 brush for label 0", state["L2_b0"])
-    s_L2_1, sp_L2_1 = add_brush_block(L2P, "L2 brush for label 1", state["L2_b1"])
-
-    L2P.addStretch(1)
-
-    def link_brush(s, sp, layer_name: str, lbl: int):
+    def link_brush(s, sp, lbl: int):
         def _from_slider(v):
             sp.setValue(v)
-            set_brush_value_for(layer_name, lbl, v)
+            set_brush_value_for(lbl, v)
         def _from_spin(v):
             s.setValue(v)
-            set_brush_value_for(layer_name, lbl, v)
+            set_brush_value_for(lbl, v)
         s.valueChanged.connect(_from_slider)
         sp.valueChanged.connect(_from_spin)
 
-    link_brush(s_L1_0, sp_L1_0, "L1", 0)
-    link_brush(s_L1_1, sp_L1_1, "L1", 1)
-    link_brush(s_L2_0, sp_L2_0, "L2", 0)
-    link_brush(s_L2_1, sp_L2_1, "L2", 1)
+    L.addWidget(QtWidgets.QLabel("Common brush sizes"))
+    for label, text in ((0, "Eraser"), (1, "Brush")):
+        _control_label, slider, spinbox = add_brush_block(
+            L,
+            text,
+            state[f"brush_b{label}"],
+        )
+        link_brush(slider, spinbox, label)
+        brush_controls[label] = (slider, spinbox)
 
     # Zoom
     zlbl = QtWidgets.QLabel("Zoom")
@@ -1888,12 +2291,6 @@ def main(argv: list[str] | None = None) -> None:
     dock_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
     dock_scroll.setWidget(dock)
 
-    l2_dock_scroll = QtWidgets.QScrollArea()
-    l2_dock_scroll.setWidgetResizable(True)
-    l2_dock_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-    l2_dock_scroll.setWidget(l2_dock)
-
-    viewer.window.add_dock_widget(l2_dock_scroll, name="L2 BRUSH", area="left")
     viewer.window.add_dock_widget(log_dock, name="LOG", area="left")
     viewer.window.add_dock_widget(dock_scroll, name="TOOLS", area="right")
 
@@ -1901,8 +2298,13 @@ def main(argv: list[str] | None = None) -> None:
     # Key bindings
     # ======================
     def bindMany(key_names: list[str], action: NavAction) -> None:
+        def run_unless_typing(*_args: object) -> None:
+            if text_input_has_focus():
+                return
+            action()
+
         for key_name in key_names:
-            viewer.bind_key(key_name, overwrite=True)(action)
+            viewer.bind_key(key_name, overwrite=True)(run_unless_typing)
 
     application = QtWidgets.QApplication.instance()
     qt_window = viewer.window._qt_window
@@ -1935,8 +2337,9 @@ def main(argv: list[str] | None = None) -> None:
     bindMany(["End"], undo_via_ctrl_z)
     bindMany(["Delete"], redo_via_ctrl_shift_z)
 
-    bindMany(["F1"], lambda *_: set_active_layer("L1"))
-    bindMany(["F2"], lambda *_: set_active_layer("L2"))
+    for class_id in sorted(CLASS_DEFINITIONS):
+        if 1 <= class_id <= 12:
+            bindMany([f"F{class_id}"], lambda cid=class_id: set_active_layer(cid))
 
     bindMany(["A"], lambda *_: set_selected_label(0))
     bindMany(["S"], lambda *_: set_selected_label(1))
